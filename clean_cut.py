@@ -1,86 +1,164 @@
-import pandas as pd
 import numpy as np
-from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import KFold, GridSearchCV
-from sklearn.ensemble import RandomForestRegressor
-import lightgbm as lgb
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Embedding, Bidirectional, LSTM, concatenate, Dense, Lambda, Dropout, \
+    BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.metrics import AUC
+from sklearn.model_selection import train_test_split
+import zipfile
+import os
 
-# 数据读取（修复转义问题）
-train = pd.read_csv('used_car_train_20200313.csv', sep=r'\s+', engine='python')
-test = pd.read_csv('used_car_testB_20200421.csv', sep=r'\s+', engine='python')
 
-# 数据预处理函数
-def preprocess(df):
-    # 统一缺失值表示
-    df.replace('-', np.nan, inplace=True)
+def read_and_preprocess(file_path, tokenizer=None, max_len=50, is_train=True):
+    queries1 = []
+    queries2 = []
+    labels = [] if is_train else None
 
-    # 日期处理
-    for col in ['regDate', 'creatDate']:
-        df[col] = pd.to_datetime(df[col], format='%Y%m%d', errors='coerce')
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if not parts:
+                continue
+            try:
+                if is_train:
+                    if len(parts) < 3: continue
+                    q1, q2, label = parts[0], parts[1], parts[2]
+                    labels.append(int(label))
+                else:
+                    if len(parts) < 2: continue
+                    q1, q2 = parts[0], parts[1]
 
-    # 时间特征工程
-    df['regYear'] = df['regDate'].dt.year
-    df['regMonth'] = df['regDate'].dt.month
-    df['creatYear'] = df['creatDate'].dt.year
-    df['reg_to_creat_days'] = (df['creatDate'] - df['regDate']).dt.days
+                queries1.append(q1.split())
+                queries2.append(q2.split())
+            except Exception as e:
+                print(f"Error processing line: {line}")
+                continue
 
-    # 处理异常值
-    df['power'] = pd.to_numeric(df['power'], errors='coerce').clip(0, 600)
-    return df
+    if is_train and tokenizer is None:
+        tokenizer = Tokenizer(num_words=30000, oov_token='<OOV>')
+        all_texts = queries1 + queries2
+        tokenizer.fit_on_texts(all_texts)
 
-# 应用预处理
-train = preprocess(train)
-test = preprocess(test)
+    seq1 = tokenizer.texts_to_sequences(queries1)
+    seq2 = tokenizer.texts_to_sequences(queries2)
 
-# 定义特征和标签
-drop_cols = ['SaleID', 'name', 'regDate', 'creatDate', 'price']
-features = [col for col in train.columns if col not in drop_cols]
-target = 'price'
+    seq1 = pad_sequences(seq1, maxlen=max_len, padding='post', truncating='post')
+    seq2 = pad_sequences(seq2, maxlen=max_len, padding='post', truncating='post')
 
-# 缺失值处理
-numeric_cols = ['power', 'kilometer'] + [f'v_{i}' for i in range(15)]
-categorical_cols = ['model', 'brand', 'bodyType', 'fuelType', 'gearbox',
-                    'notRepairedDamage', 'regionCode', 'seller', 'offerType']
+    return (seq1, seq2, np.array(labels), tokenizer) if is_train else (seq1, seq2)
 
-for df in [train, test]:
-    # 数值型填充
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-    df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
 
-    # 类别型填充
-    for col in categorical_cols:
-        df[col] = df[col].fillna(df[col].mode()[0])
-        df[col] = df[col].astype('category')
+# 超参数配置
+MAX_LEN = 50
+EMBED_DIM = 300
+VOCAB_SIZE = 30000
 
-# 对类别型特征进行编码
-for col in categorical_cols:
-    train[col] = train[col].cat.codes
-    test[col] = test[col].cat.codes
+# 读取数据
+print("Loading training data...")
+train_seq1, train_seq2, train_labels, tokenizer = read_and_preprocess(
+    'gaiic_track3_round1_train_20210228.csv',
+    max_len=MAX_LEN,
+    is_train=True
+)
 
-X_train = train[features]
-y_train = train[target]
-X_test = test[features]
+print("Loading test data...")
+test_seq1, test_seq2 = read_and_preprocess(
+    'gaiic_track3_round1_testB_20210317.csv',
+    tokenizer=tokenizer,
+    max_len=MAX_LEN,
+    is_train=False
+)
 
-# 使用 LightGBM 模型
-lgb_model = lgb.LGBMRegressor(random_state=42)
+# 划分验证集
+X_train1, X_val1, X_train2, X_val2, y_train, y_val = train_test_split(
+    train_seq1, train_seq2, train_labels,
+    test_size=0.15,
+    random_state=42,
+    stratify=train_labels
+)
 
-# 定义参数网格
-param_grid = {
-    'n_estimators': [100, 200, 300],
-    'learning_rate': [0.01, 0.05, 0.1],
-    'num_leaves': [31, 40, 50]
-}
+# 使用随机初始化的嵌入矩阵
+print("Initializing random embedding matrix...")
+embedding_matrix = np.random.normal(size=(VOCAB_SIZE + 1, EMBED_DIM))
 
-# 使用网格搜索进行参数调优
-grid_search = GridSearchCV(lgb_model, param_grid, cv=5, scoring='neg_mean_absolute_error')
-grid_search.fit(X_train, y_train)
 
-best_model = grid_search.best_estimator_
+def build_efficient_model():
+    input1 = Input(shape=(MAX_LEN,))
+    input2 = Input(shape=(MAX_LEN,))
 
-# 预测
-test_preds = best_model.predict(X_test)
+    # 共享嵌入层（可训练）
+    embedding = Embedding(
+        VOCAB_SIZE + 1,
+        EMBED_DIM,
+        weights=[embedding_matrix],
+        mask_zero=True,
+        trainable=True
+    )
 
-# 生成提交文件
-submission = pd.DataFrame({'SaleID': test['SaleID'], 'price': test_preds})
-submission['price'] = submission['price'].round().astype(int)
-submission.to_csv('submission.csv', index=False)
+    # 简化模型结构
+    bilstm = Bidirectional(LSTM(96, return_sequences=False))
+
+    x1 = bilstm(embedding(input1))
+    x2 = bilstm(embedding(input2))
+
+    # 关键特征交互
+    diff = Lambda(lambda x: abs(x[0] - x[1]))([x1, x2])
+    product = Lambda(lambda x: x[0] * x[1])([x1, x2])
+
+    merged = concatenate([x1, x2, diff, product])
+
+    # 分类头
+    x = BatchNormalization()(merged)
+    x = Dropout(0.3)(x)
+    x = Dense(192, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.2)(x)
+    output = Dense(1, activation='sigmoid')(x)
+
+    model = Model(inputs=[input1, input2], outputs=output)
+
+    # 使用更高效的优化器
+    optimizer = Adam(learning_rate=3e-4)
+
+    model.compile(
+        optimizer=optimizer,
+        loss='binary_crossentropy',
+        metrics=[AUC(name='auc')]
+    )
+    return model
+
+
+# 初始化模型
+print("Building model...")
+model = build_efficient_model()
+
+# 回调函数
+callbacks = [
+    EarlyStopping(monitor='val_auc', patience=3, mode='max', verbose=1, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_auc', factor=0.5, patience=2, mode='max', min_lr=1e-5)
+]
+
+# 训练模型（减少轮次）
+print("Training model...")
+history = model.fit(
+    [X_train1, X_train2], y_train,
+    validation_data=([X_val1, X_val2], y_val),
+    epochs=8,  # 减少训练轮次
+    batch_size=1024,  # 增大批次提升训练速度
+    callbacks=callbacks,
+    verbose=1  # 显示进度条
+)
+
+# 生成预测
+print("Generating predictions...")
+test_pred = model.predict([test_seq1, test_seq2], batch_size=2048).flatten()
+
+# 保存结果
+np.savetxt('result.txt', test_pred, fmt='%.6f')
+with zipfile.ZipFile('result.zip', 'w') as zipf:
+    zipf.write('result.txt')
+
+print("Training completed. Results saved to result.zip")
